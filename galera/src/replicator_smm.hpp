@@ -182,6 +182,7 @@ namespace galera
         const gu::Config& params() const { return config_; }
 
         wsrep_seqno_t pause();
+        wsrep_seqno_t try_pause();
         void          resume();
 
         void          desync();

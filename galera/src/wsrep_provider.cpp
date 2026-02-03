@@ -1544,6 +1544,26 @@ wsrep_status_t galera_resume (wsrep_t* gh)
 
 
 extern "C"
+wsrep_seqno_t galera_try_pause (wsrep_t* gh)
+{
+    assert(gh != 0);
+    assert(gh->ctx != 0);
+
+    REPL_CLASS * repl(reinterpret_cast< REPL_CLASS * >(gh->ctx));
+
+    try
+    {
+        return repl->try_pause();
+    }
+    catch (gu::Exception& e)
+    {
+        log_warn << "Node try_pause failed: " << e.what();
+        return -e.get_errno();
+    }
+}
+
+
+extern "C"
 wsrep_status_t galera_desync (wsrep_t* gh)
 {
     assert(gh != 0);
@@ -1659,6 +1679,7 @@ static wsrep_t galera_str = {
     &galera_rotate_gcache_key,
 #endif /* PXC */
     &galera_pause,
+    &galera_try_pause,
     &galera_resume,
     &galera_desync,
     &galera_resync,
