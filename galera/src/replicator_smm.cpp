@@ -184,6 +184,10 @@ galera::ReplicatorSMM::ReplicatorSMM(const struct wsrep_init_args* args)
     commit_monitor_     (),
 #endif /* HAVE_PSI_INTERFACE */
     causal_read_timeout_(config_.get(Param::causal_read_timeout)),
+#ifdef PXC
+    force_sst_after_inconsistency_(
+        config_.get<bool>(Param::force_sst_after_inconsistency)),
+#endif /* PXC */
     receivers_          (),
     replicated_         (),
     replicated_bytes_   (),
@@ -495,7 +499,9 @@ wsrep_status_t galera::ReplicatorSMM::async_recv(void* recv_ctx)
         {
             if (GcsActionSource::INCONSISTENCY_CODE == rc)
             {
-                st_.mark_corrupt();
+                // Mark node corrupt and initiate cluster leave due to
+                // inconsistency
+                mark_corrupt_and_close();
                 retval = WSREP_FATAL;
             }
             else
