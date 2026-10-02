@@ -40,6 +40,7 @@ namespace galera
         // Default constructor
         View();
         // Construct View from wsrep_view_info_t
+        // In PXC, arbitrator members are not included (see galera_view.cpp).
         View(const wsrep_view_info_t&);
         // Destructor
         ~View();

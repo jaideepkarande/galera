@@ -13,6 +13,10 @@
 #include "test_key.hpp"
 
 #include <check.h>
+#ifdef PXC
+#include <cstring>
+#include <vector>
+#endif /* PXC */
 
 namespace
 {
@@ -1492,6 +1496,96 @@ START_TEST(cert_certify_no_match)
 END_TEST
 
 
+#ifdef PXC
+// PXC-5300: arbitrator (garbd) members, which have an empty incoming address
+// and GCS_ARBITRATOR_NAME, must not be part of the NBO end barrier.
+namespace
+{
+    class ViewInfo
+    {
+    public:
+        explicit ViewInfo(int const memb_num)
+            : buf_(sizeof(wsrep_view_info_t) +
+                   (memb_num - 1) * sizeof(wsrep_member_info_t), 0)
+        {
+            vi()->memb_num = memb_num;
+            for (int i(0); i < memb_num; ++i)
+                vi()->members[i].id.data[0] = i + 1;
+        }
+        void set(int const i, const char* const name, const char* const inc)
+        {
+            ck_assert(::strlen(name) < sizeof(vi()->members[i].name));
+            ck_assert(::strlen(inc) < sizeof(vi()->members[i].incoming));
+            ::strcpy(vi()->members[i].name, name);
+            ::strcpy(vi()->members[i].incoming, inc);
+        }
+        const wsrep_uuid_t& id(int const i) { return vi()->members[i].id; }
+        const wsrep_view_info_t& get() { return *vi(); }
+    private:
+        wsrep_view_info_t* vi()
+        {
+            return reinterpret_cast<wsrep_view_info_t*>(&buf_[0]);
+        }
+        std::vector<char> buf_;
+    };
+}
+
+START_TEST(test_view_skips_arbitrator)
+{
+    // Two data nodes and garbd
+    ViewInfo vi(3);
+    vi.set(0, "node1", "127.0.0.1:3306");
+    vi.set(1, "node2", "127.0.0.1:3307");
+    vi.set(2, "garb", "");
+
+    galera::View const view(vi.get());
+    galera::View::MembSet ended;
+    ended.insert(vi.id(0));
+    ck_assert(!view.subset_of(ended));
+    ended.insert(vi.id(1));
+    ck_assert_msg(view.subset_of(ended),
+                  "data nodes have ended NBO, arbitrator must be ignored");
+}
+END_TEST
+
+START_TEST(test_view_keeps_data_node_without_incoming)
+{
+    // A data node without incoming address (e.g. bind_address=127.0.0.1)
+    // and a garbd started with a custom name must still be waited for.
+    ViewInfo vi(3);
+    vi.set(0, "node1", "127.0.0.1:3306");
+    vi.set(1, "node2", "");
+    vi.set(2, "my_arbitrator", "");
+
+    galera::View const view(vi.get());
+    galera::View::MembSet ended;
+    ended.insert(vi.id(0));
+    ended.insert(vi.id(1));
+    ck_assert(!view.subset_of(ended));
+    ended.insert(vi.id(2));
+    ck_assert(view.subset_of(ended));
+}
+END_TEST
+
+START_TEST(test_view_all_arbitrators)
+{
+    // If every member looks like an arbitrator, all of them are waited for.
+    ViewInfo vi(2);
+    vi.set(0, "garb", "");
+    vi.set(1, "garb", "");
+
+    galera::View const view(vi.get());
+    galera::View::MembSet ended;
+    ck_assert(!view.subset_of(ended));
+    ended.insert(vi.id(0));
+    ck_assert(!view.subset_of(ended));
+    ended.insert(vi.id(1));
+    ck_assert(view.subset_of(ended));
+}
+END_TEST
+#endif /* PXC */
+
+
 Suite* certification_suite()
 {
     Suite* s(suite_create("certification"));
@@ -1512,6 +1606,14 @@ Suite* certification_suite()
     t = tcase_create("certification_nbo");
     tcase_add_test(t, test_certification_nbo);
     suite_add_tcase(s, t);
+
+#ifdef PXC
+    t = tcase_create("view_skips_arbitrator");
+    tcase_add_test(t, test_view_skips_arbitrator);
+    tcase_add_test(t, test_view_keeps_data_node_without_incoming);
+    tcase_add_test(t, test_view_all_arbitrators);
+    suite_add_tcase(s, t);
+#endif /* PXC */
 
     t = tcase_create("certification_commit_fragment");
     tcase_add_test(t, test_certification_commit_fragment);
