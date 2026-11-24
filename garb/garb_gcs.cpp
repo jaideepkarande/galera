@@ -68,6 +68,15 @@ again:
         gu_throw_error(-ret) << "Receiving from group failed";
     }
     
+#ifdef PXC
+    /* PXC-4752: the arbitrator has no applier - RecvLoop::one_loop() consumes
+     * the action synchronously right after this call and the arbitrator
+     * reports no wsrep status, so release it immediately. Skipping this would
+     * leak recv_q_applying in GCS. Only write sets are accounted, so only
+     * write sets are released. */
+    if (ret > 0 && GCS_ACT_WRITESET == act.type) gcs_recv_writeset_done(gcs_);
+#endif /* PXC */
+
     return ret;
 }
 
