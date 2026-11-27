@@ -530,9 +530,9 @@ void *gcs_test_recv (void *arg)
             test_after_recv (thread);
             //puts (thread->log_msg); fflush (stdout);
 #ifdef PXC
-            /* PXC-4752: write sets are counted in recv_q_applying by gcs_recv()
-             * until released, so release here or the queue length reported by
-             * gcs_get_stats() grows without bound. */
+            /* PXC-4752: gcs_recv() keeps write sets counted in the recv_q
+             * statistics until they are released, so release here or the
+             * queue length reported by gcs_get_stats() keeps growing. */
             gcs_recv_writeset_done (gcs);
 #endif /* PXC */
             break;

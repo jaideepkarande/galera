@@ -48,6 +48,12 @@ struct gu_fifo
     uint  used;
     uint  used_max;
     uint  used_min;
+#ifdef PXC
+    /* PXC-4752: items taken off the queue with gu_fifo_hold_head() and not
+     * yet finished with gu_fifo_held_done(). They are still counted in the
+     * statistics (gu_fifo_stats_get()), but not in gu_fifo_length(). */
+    uint  held;
+#endif /* PXC */
     int   get_err;
     bool  closed;
 #ifndef NDEBUG
@@ -339,6 +345,17 @@ void* gu_fifo_get_head (gu_fifo_t* q, int* err)
     }
 }
 
+/*! Length used for the statistics: the items in the queue plus, in PXC,
+ *  the held items (PXC-4752). Must be called with the FIFO locked. */
+static inline uint fifo_stats_length (const gu_fifo_t* q)
+{
+#ifdef PXC
+    return q->used + q->held;
+#else
+    return q->used;
+#endif /* PXC */
+}
+
 /*! Unprotected helper for gu_fifo_pop_head() and gu_fifo_clear() */
 static inline
 void fifo_advance_head (gu_fifo_t* q)
@@ -361,8 +378,8 @@ void fifo_advance_head (gu_fifo_t* q)
 
     q->head = FIFO_INC(q, q->head);
     q->used--;
-    if (gu_unlikely(q->used < q->used_min)) {
-        q->used_min = q->used;
+    if (gu_unlikely(fifo_stats_length(q) < q->used_min)) {
+        q->used_min = fifo_stats_length(q);
     }
 }
 
@@ -421,10 +438,10 @@ void* gu_fifo_get_tail (gu_fifo_t* q)
 void gu_fifo_push_tail (gu_fifo_t* q)
 {
     q->tail = FIFO_INC(q, q->tail);
-    q->q_len += q->used;
+    q->q_len += fifo_stats_length(q);
     q->used++;
-    if (gu_unlikely(q->used > q->used_max)) {
-        q->used_max = q->used;
+    if (gu_unlikely(fifo_stats_length(q) > q->used_max)) {
+        q->used_max = fifo_stats_length(q);
     }
     q->q_len_samples++;
 
@@ -449,6 +466,33 @@ long gu_fifo_max_length (gu_fifo_t* q)
     */
     return q->length-1;
 }
+
+/*! PXC-4752: keeps the head item counted in the statistics after it is
+ *  popped, until gu_fifo_held_done() is called for it. Must be called with
+ *  the FIFO locked by gu_fifo_get_head(), before gu_fifo_pop_head(). */
+void gu_fifo_hold_head (gu_fifo_t* q)
+{
+    assert (q->locked);
+    assert (q->used > 0);
+    q->held++;
+}
+
+/*! PXC-4752: a held item is finished, so it is no longer counted in the
+ *  statistics. */
+void gu_fifo_held_done (gu_fifo_t* q)
+{
+    fifo_lock (q);
+
+    assert (q->held > 0);
+    if (gu_likely(q->held > 0)) {
+        q->held--;
+        if (gu_unlikely(fifo_stats_length(q) < q->used_min)) {
+            q->used_min = fifo_stats_length(q);
+        }
+    }
+
+    fifo_unlock (q);
+}
 #endif /* PXC */
 
 /*! returns how many items were in the queue per push_tail() */
@@ -457,7 +501,7 @@ void gu_fifo_stats_get (gu_fifo_t* q, int* q_len, int* q_len_max,
 {
     fifo_lock (q);
 
-    *q_len = q->used;
+    *q_len = fifo_stats_length(q);
     *q_len_max = q->used_max;
     *q_len_min = q->used_min;
 
@@ -486,8 +530,8 @@ void gu_fifo_stats_flush(gu_fifo_t* q)
 {
     fifo_lock (q);
 
-    q->used_max = q->used;
-    q->used_min = q->used;
+    q->used_max = fifo_stats_length(q);
+    q->used_min = fifo_stats_length(q);
     q->q_len = 0;
     q->q_len_samples = 0;
 

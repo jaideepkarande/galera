@@ -278,11 +278,11 @@ extern long gcs_recv (gcs_conn_t*        conn,
  * A write set that gcs_recv() has handed out has left the receive queue but is
  * still waiting to be applied, so GCS keeps counting it in the receive queue
  * length it reports through gcs_get_stats() (wsrep_local_recv_queue and
- * friends). Without this call that count would drift upwards for good.
+ * friends). Without this call that count would stay too high forever.
  *
  * Must be called exactly once for every gcs_recv() call that returned a write
  * set - that is, returned > 0 with action type GCS_ACT_WRITESET - and not at
- * all for any other call. Other action types are deliberately not accounted:
+ * all for any other call. Other action types are deliberately not counted:
  * their handlers may block for a very long time (a GCS_ACT_CCHANGE drives
  * request_state_transfer(), which waits for the whole state transfer), and
  * wsrep_local_recv_queue is documented as the number of *write sets* waiting

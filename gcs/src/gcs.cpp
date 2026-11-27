@@ -168,36 +168,6 @@ struct gcs_conn
     ssize_t      recv_q_size;
     gu_thread_t  recv_thread;
 
-#ifdef PXC
-    /* PXC-4752: wsrep_local_recv_queue reports the "pending" count:
-     *     gu_fifo_length(recv_q) + recv_q_applying
-     * i.e. actions still queued plus write sets an applier is working on.
-     * It grows only in GCS_FIFO_PUSH_TAIL(); it shrinks in
-     * gcs_recv_writeset_done() and, for actions that are not write sets, when
-     * gcs_recv() pops them.
-     * Handing a write set to an applier does not change it: the write set
-     * just moves from the FIFO to recv_q_applying.
-     *
-     * ALL of the fields below are guarded by the recv_q lock, which every
-     * accessor already holds or takes. Keeping the whole accounting under one
-     * lock is what makes the watermarks exact and race-free; it costs one
-     * extra lock/unlock of the recv_q mutex per applied write set. That mutex
-     * is shared with the GCS receive thread and the other appliers, but the
-     * critical section is a few arithmetic operations on a path that has just
-     * committed a transaction to the storage engine. */
-
-    /* Write sets taken from recv_q by an applier and not yet released. */
-    long      recv_q_applying;
-    /* Highest pending count since the last FLUSH STATUS. */
-    long      recv_q_pending_max;
-    /* Lowest pending count since the last FLUSH STATUS. */
-    long      recv_q_pending_min;
-    /* Sum of the pending count sampled at each push, for the average. */
-    long long recv_q_pending_sum;
-    /* Number of samples in recv_q_pending_sum. */
-    long long recv_q_pending_samples;
-#endif /* PXC */
-
     /* Message receiving timeout - absolute date in nanoseconds */
     long long    timeout;
 
@@ -371,13 +341,6 @@ gcs_conn::gcs_conn(gu::Config& conf,
     recv_q(),
     recv_q_size(),
     recv_thread(),
-#ifdef PXC
-    recv_q_applying(0),
-    recv_q_pending_max(0),
-    recv_q_pending_min(0),
-    recv_q_pending_sum(0),
-    recv_q_pending_samples(0),
-#endif /* PXC */
     timeout(),
     fc_lock(),
     stfc(),
@@ -1549,37 +1512,10 @@ gcs_handle_actions (gcs_conn_t* conn, struct gcs_act_rcvd& rcvd)
 }
 
 #ifdef PXC
-/*! PXC-4752: pending count = actions queued in recv_q + write sets applying.
- *  The recv_q lock must be held: gu_fifo_length() is an unprotected accessor
- *  and recv_q_applying is a plain counter. */
-static inline long
-_recv_q_pending_length (gcs_conn_t* conn)
-{
-    assert (gu_fifo_locked(conn->recv_q));
-    return gu_fifo_length(conn->recv_q) + conn->recv_q_applying;
-}
-
-/*! PXC-4752: lowers recv_q_pending_min if the pending count dropped below it.
- *  Must be called with the recv_q lock held, from the places where the
- *  pending count shrinks in normal operation: gcs_recv() and
- *  gcs_recv_writeset_done(). The bulk drops of the FIFO on inconsistency
- *  (gu_fifo_clear()) and on the arbitrator shutdown drain do not call it;
- *  that is harmless, because _get_recv_q_pending_stats() clamps the reported
- *  minimum to the current count. */
-static inline void
-_recv_q_pending_min_update (gcs_conn_t* conn, long pending_length)
-{
-    assert (gu_fifo_locked(conn->recv_q));
-    if (gu_unlikely(pending_length < conn->recv_q_pending_min))
-        conn->recv_q_pending_min = pending_length;
-}
-
-/*! PXC-4752: true if the action is a write set, the only kind counted in
- *  recv_q_applying. Other action types
- *  are consumed by handlers that may legitimately block for a very long time
- *  (a GCS_ACT_CCHANGE drives request_state_transfer(), which waits for the
- *  whole state transfer), and wsrep_local_recv_queue is documented as the
- *  number of *write sets* waiting to be applied. */
+/*! PXC-4752: true if the action is a write set, the only kind kept counted in
+ *  the recv_q statistics after gcs_recv() hands it out. Other actions can be
+ *  held for a very long time: a configuration change on a joining node waits
+ *  for the whole SST. */
 static inline bool
 _recv_q_is_writeset (const struct gcs_action* action)
 {
@@ -1593,25 +1529,6 @@ GCS_FIFO_PUSH_TAIL (gcs_conn_t* conn, ssize_t size)
     if (conn->progress_) conn->progress_->update_total(1);
 
     conn->recv_q_size += size;
-
-#ifdef PXC
-    /* PXC-4752: samples the pending count for _avg and updates _max.
-     * The recv_q lock is
-     * still held here (gu_fifo_push_tail() below releases it) and this is the
-     * only place where the pending count grows, so recv_q_pending_max is an
-     * exact high watermark. The sampling convention mirrors gu_fifo_push_tail()
-     * exactly: the average samples the length as seen *before* this push, the
-     * maximum is taken *after* it. */
-    {
-        long const pending_before_push (_recv_q_pending_length(conn));
-        conn->recv_q_pending_sum += pending_before_push;
-        conn->recv_q_pending_samples++;
-
-        if (gu_unlikely(pending_before_push + 1 > conn->recv_q_pending_max))
-            conn->recv_q_pending_max = pending_before_push + 1;
-    }
-#endif /* PXC */
-
     gu_fifo_push_tail(conn->recv_q);
 }
 
@@ -2560,23 +2477,15 @@ long gcs_recv (gcs_conn_t*        conn,
         }
 
 #ifdef PXC
-        /* PXC-4752: a write set handed to an applier moves from the FIFO to
-         * recv_q_applying, so that it keeps being reported by
-         * wsrep_local_recv_queue until it is applied. Done here rather than in
-         * GCS_FIFO_POP_HEAD() because the GCS_FOR_GARB shutdown drain pops
-         * without a consumer that would ever release the action.
-         * _recv_q_is_writeset() also requires size > 0, which is what
-         * this function returns to signal "an action was received" - so the
-         * caller arms its gcs_recv_writeset_done() on the very same condition.
-         * Still under the recv_q lock, so the FIFO -> recv_q_applying
-         * hand-off is atomic for every observer. */
-        if (_recv_q_is_writeset(action)) conn->recv_q_applying++;
-
-        /* The action is about to leave the FIFO. For a write set that is a
-         * no-op for the pending count (it just moved to recv_q_applying);
-         * for any other action type the pending count drops by one. */
-        _recv_q_pending_min_update (conn, gu_fifo_length(conn->recv_q) - 1 +
-                                          conn->recv_q_applying);
+        /* PXC-4752: a write set handed to an applier stays counted in the
+         * recv_q statistics (wsrep_local_recv_queue, _max, _min, _avg) until
+         * the applier calls gcs_recv_writeset_done(). It is done here, not in
+         * GCS_FIFO_POP_HEAD(), because the garbd shutdown loop also pops
+         * actions and nobody finishes those. The size > 0 check in
+         * _recv_q_is_writeset() matches the "an action was received" return
+         * value that callers use to decide whether to call
+         * gcs_recv_writeset_done(). */
+        if (_recv_q_is_writeset(action)) gu_fifo_hold_head (conn->recv_q);
 #endif /* PXC */
 
         GCS_FIFO_POP_HEAD (conn, action->size); // release the queue
@@ -2891,65 +2800,22 @@ gcs_seqno_t gcs_local_sequence(gcs_conn_t* conn)
 
 #ifdef PXC
 /*! PXC-4752: an applier has finished with a write set from gcs_recv(), so it
- *  is no longer counted in recv_q_applying. */
+ *  is no longer counted in the recv_q statistics. */
 void
 gcs_recv_writeset_done (gcs_conn_t* conn)
 {
-    gu_fifo_lock (conn->recv_q);
-    {
-        assert (conn->recv_q_applying > 0);
-
-        if (gu_likely(conn->recv_q_applying > 0)) conn->recv_q_applying--;
-
-        _recv_q_pending_min_update (conn, _recv_q_pending_length(conn));
-    }
-    gu_fifo_release (conn->recv_q);
-}
-
-/*! PXC-4752: fills wsrep_local_recv_queue and its _min/_max/_avg from the
- *  pending counters (queued + applying). */
-static void
-_get_recv_q_pending_stats (gcs_conn_t* conn, struct gcs_stats* stats)
-{
-    long      pending_length, pending_max, pending_min;
-    long long sum, samples;
-
-    gu_fifo_lock (conn->recv_q);
-    {
-        pending_length = _recv_q_pending_length (conn);
-        pending_max = conn->recv_q_pending_max;
-        pending_min = conn->recv_q_pending_min;
-        sum         = conn->recv_q_pending_sum;
-        samples     = conn->recv_q_pending_samples;
-    }
-    gu_fifo_release (conn->recv_q);
-
-    /* The accounting is balanced by construction, but this value is a user
-     * facing status variable and the exactly-once contract of
-     * gcs_recv_writeset_done() is spread over two components - never let a
-     * hypothetical imbalance surface as a negative queue length. */
-    if (gu_unlikely(pending_length < 0)) pending_length = 0;
-
-    stats->recv_q_len     = int(pending_length);
-    stats->recv_q_len_max = int(std::max (pending_max, pending_length));
-    stats->recv_q_len_min = int(std::max (0L, std::min (pending_min,
-                                                        pending_length)));
-    stats->recv_q_len_avg = samples > 0 ? double(sum) / double(samples) : 0.0;
+    gu_fifo_held_done (conn->recv_q);
 }
 #endif /* PXC */
 
 void
 gcs_get_stats (gcs_conn_t* conn, struct gcs_stats* stats)
 {
-#ifdef PXC
-    _get_recv_q_pending_stats (conn, stats);
-#else
     gu_fifo_stats_get (conn->recv_q,
                        &stats->recv_q_len,
                        &stats->recv_q_len_max,
                        &stats->recv_q_len_min,
                        &stats->recv_q_len_avg);
-#endif /* PXC */
 
     stats->recv_q_size = conn->recv_q_size;
 
@@ -2983,22 +2849,6 @@ void
 gcs_flush_stats(gcs_conn_t* conn)
 {
     gu_fifo_stats_flush(conn->recv_q);
-
-#ifdef PXC
-    /* PXC-4752: resets the pending watermarks (_min/_max/_avg) for FLUSH
-     * STATUS, the same way gu_fifo_stats_flush() resets the FIFO's own ones. */
-    gu_fifo_lock (conn->recv_q);
-    {
-        long const pending_length (_recv_q_pending_length(conn));
-
-        conn->recv_q_pending_max     = pending_length;
-        conn->recv_q_pending_min     = pending_length;
-        conn->recv_q_pending_sum     = 0;
-        conn->recv_q_pending_samples = 0;
-    }
-    gu_fifo_release (conn->recv_q);
-#endif /* PXC */
-
     gcs_sm_stats_flush (conn->sm);
     conn->stats_fc_stop_sent = 0;
     conn->stats_fc_cont_sent = 0;
