@@ -54,8 +54,15 @@ extern long  gu_fifo_length    (gu_fifo_t* q);
 #ifdef PXC
 /*! Returns the maximum number of items allowed in the queue (unprotected) */
 extern long  gu_fifo_max_length(gu_fifo_t* q);
+/*! PXC-4752: keep counting the head item in the statistics after it is
+ *  popped, until gu_fifo_held_done(). Call with the FIFO locked by
+ *  gu_fifo_get_head(), before gu_fifo_pop_head(). */
+extern void  gu_fifo_hold_head (gu_fifo_t* q);
+/*! PXC-4752: a held item is finished; stop counting it. */
+extern void  gu_fifo_held_done (gu_fifo_t* q);
 #endif /* PXC */
-/*! Return how many items were in the queue on average per push_tail() */
+/*! Return the statistics: current, maximum, minimum and average (per
+ *  push_tail()) number of items. In PXC they include held items. */
 extern void  gu_fifo_stats_get (gu_fifo_t* q, int* q_len, int* q_len_max,
                                 int* q_len_min, double* q_len_avg);
 /*! Flush stats counters */

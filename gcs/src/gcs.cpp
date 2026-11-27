@@ -1511,6 +1511,18 @@ gcs_handle_actions (gcs_conn_t* conn, struct gcs_act_rcvd& rcvd)
     return ret;
 }
 
+#ifdef PXC
+/*! PXC-4752: true if the action is a write set, the only kind kept counted in
+ *  the recv_q statistics after gcs_recv() hands it out. Other actions can be
+ *  held for a very long time: a configuration change on a joining node waits
+ *  for the whole SST. */
+static inline bool
+_recv_q_is_writeset (const struct gcs_action* action)
+{
+    return action->size > 0 && GCS_ACT_WRITESET == action->type;
+}
+#endif /* PXC */
+
 static inline void
 GCS_FIFO_PUSH_TAIL (gcs_conn_t* conn, ssize_t size)
 {
@@ -2464,6 +2476,18 @@ long gcs_recv (gcs_conn_t*        conn,
             }
         }
 
+#ifdef PXC
+        /* PXC-4752: a write set handed to an applier stays counted in the
+         * recv_q statistics (wsrep_local_recv_queue, _max, _min, _avg) until
+         * the applier calls gcs_recv_writeset_done(). It is done here, not in
+         * GCS_FIFO_POP_HEAD(), because the garbd shutdown loop also pops
+         * actions and nobody finishes those. The size > 0 check in
+         * _recv_q_is_writeset() matches the "an action was received" return
+         * value that callers use to decide whether to call
+         * gcs_recv_writeset_done(). */
+        if (_recv_q_is_writeset(action)) gu_fifo_hold_head (conn->recv_q);
+#endif /* PXC */
+
         GCS_FIFO_POP_HEAD (conn, action->size); // release the queue
 
         if (gu_unlikely(send_cont) && (err = gcs_fc_cont_end(conn))) {
@@ -2773,6 +2797,16 @@ gcs_seqno_t gcs_local_sequence(gcs_conn_t* conn)
 {
     return gu_atomic_fetch_and_add(&conn->local_act_id, 1);
 }
+
+#ifdef PXC
+/*! PXC-4752: an applier has finished with a write set from gcs_recv(), so it
+ *  is no longer counted in the recv_q statistics. */
+void
+gcs_recv_writeset_done (gcs_conn_t* conn)
+{
+    gu_fifo_held_done (conn->recv_q);
+}
+#endif /* PXC */
 
 void
 gcs_get_stats (gcs_conn_t* conn, struct gcs_stats* stats)

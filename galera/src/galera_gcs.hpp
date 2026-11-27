@@ -33,6 +33,12 @@ namespace galera
         virtual ssize_t set_initial_position(const gu::GTID& gtid) = 0;
         virtual void    close() = 0;
         virtual ssize_t recv(gcs_action& act) = 0;
+#ifdef PXC
+        /* PXC-4752: tells GCS that a write set returned by recv() is done.
+         * Call exactly once per write set (recv() > 0, GCS_ACT_WRITESET),
+         * so that GCS stops counting it in wsrep_local_recv_queue. */
+        virtual void    recv_writeset_done() = 0;
+#endif /* PXC */
 
         typedef WriteSetNG::GatherVector WriteSetVector;
 
@@ -122,6 +128,13 @@ namespace galera
         {
             return gcs_recv(conn_, &act);
         }
+
+#ifdef PXC
+        void recv_writeset_done()   /* PXC-4752 */
+        {
+            gcs_recv_writeset_done(conn_);
+        }
+#endif /* PXC */
 
         ssize_t sendv(const WriteSetVector& actv, size_t act_len,
                       gcs_act_type_t act_type, bool scheduled, bool grab)
@@ -311,6 +324,9 @@ namespace galera
         void close();
 
         ssize_t recv(gcs_action& act);
+#ifdef PXC
+        void recv_writeset_done() { }   /* PXC-4752: nothing is queued here */
+#endif /* PXC */
 
         ssize_t sendv(const WriteSetVector&, size_t, gcs_act_type_t, bool, bool)
         { return -ENOSYS; }
